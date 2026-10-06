@@ -1,4 +1,4 @@
-"""Alpha Radar V16.6 Dynamic Intraday Freeze — completed-day selection + realtime execution UI."""
+"""Alpha Radar V16.6.1 Research Detail Hotfix — dynamic intraday + resilient on-demand research UI."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -203,36 +203,177 @@ def _quick_html(stock: dict) -> str:
     return "<div class='quick'>" + "".join(cells) + "</div>"
 
 
-def _render_fundamental_charts(stock: dict, key: str):
+def _merge_research(base: dict | None, fresh: dict | None) -> dict:
+    """Prefer usable on-demand sections without discarding an existing good snapshot."""
+    base = dict(base or {})
+    fresh = dict(fresh or {})
+    merged = dict(base)
+    for section in ["monthly_revenue", "financials", "valuation", "institutional_flow", "main_force_proxy"]:
+        old = base.get(section) or {}
+        cur = fresh.get(section) or {}
+        usable = bool(
+            cur.get("available")
+            or cur.get("rows")
+            or cur.get("quarters")
+            or cur.get("history_quarters")
+            or cur.get("daily_rows")
+            or cur.get("latest")
+            or cur.get("latest_ytd_eps") is not None
+        )
+        if usable or not old:
+            merged[section] = cur
+    sources = []
+    for src in [base.get("source"), fresh.get("source")]:
+        if src and str(src) not in sources:
+            sources.append(str(src))
+    if sources:
+        merged["source"] = " + ".join(sources)
+    if fresh.get("fetched_at"):
+        merged["fetched_at"] = fresh.get("fetched_at")
+    if fresh.get("error"):
+        merged["detail_error"] = fresh.get("error")
+    return merged
+
+
+def _research_detail_for_ticker(stock: dict, force: bool = False) -> tuple[dict, str | None]:
+    """Load detail lazily and keep it in Streamlit session state for 15 minutes."""
+    ticker = str(stock.get("ticker") or "").strip()
+    embedded = stock.get("research") or {}
+    if not ticker:
+        return embedded, "股票代碼缺失"
+    cache = st.session_state.setdefault("alpha_research_detail_cache", {})
+    now_ts = time.time()
+    item = cache.get(ticker) if isinstance(cache, dict) else None
+    item_ttl = 60 if isinstance(item, dict) and item.get("error") else 900
+    if (
+        not force
+        and isinstance(item, dict)
+        and isinstance(item.get("data"), dict)
+        and now_ts - float(item.get("ts") or 0.0) < item_ttl
+    ):
+        return _merge_research(embedded, item.get("data")), item.get("error")
+    try:
+        fresh = service.research_on_demand(ticker, DATA_DIR, include_branch=False)
+        err = str(fresh.get("error")) if isinstance(fresh, dict) and fresh.get("error") else None
+        cache[ticker] = {"ts": now_ts, "data": fresh if isinstance(fresh, dict) else {}, "error": err}
+        return _merge_research(embedded, fresh), err
+    except Exception as exc:
+        err = safe_error_text(exc, mask_tokens=(os.getenv("FINMIND_TOKEN", ""),))
+        cache[ticker] = {"ts": now_ts, "data": {}, "error": err}
+        return embedded, err
+
+
+def _render_fundamental_details(stock: dict, key: str):
+    """Render revenue/EPS/institutional detail defensively; never blank the whole card."""
     rev, fin, _, inst, _ = _research(stock)
+    source = str((stock.get("research") or {}).get("source") or "")
+    rendered = 0
+
+    st.markdown("#### 月營收")
     rows = rev.get("rows") or []
     if rows:
-        rdf = pd.DataFrame(rows[-24:])
-        if not rdf.empty and {"month","revenue_billion"}.issubset(rdf.columns):
-            fig = go.Figure()
-            fig.add_bar(x=rdf["month"], y=pd.to_numeric(rdf["revenue_billion"], errors="coerce"), name="月營收")
-            fig.update_layout(height=250, margin=dict(l=5,r=5,t=8,b=5), showlegend=False, paper_bgcolor="#fffefb", plot_bgcolor="#fffefb", xaxis_title="", yaxis_title="億元")
-            fig.update_xaxes(nticks=6, fixedrange=True)
-            fig.update_yaxes(gridcolor="#ecebe5", fixedrange=True)
-            st.plotly_chart(fig, use_container_width=True, key=f"{key}_rev", config={"displayModeBar":False})
+        rdf = pd.DataFrame(rows[-24:]).copy()
+        keep = [c for c in ["month", "revenue_billion", "mom_pct", "yoy_pct"] if c in rdf.columns]
+        if keep:
+            rdf = rdf[keep]
+            rdf = rdf.rename(columns={"month":"月份", "revenue_billion":"營收(億元)", "mom_pct":"MoM(%)", "yoy_pct":"YoY(%)"})
+            st.dataframe(rdf.tail(12), hide_index=True, use_container_width=True)
+            rendered += 1
+        if {"month", "revenue_billion"}.issubset(pd.DataFrame(rows).columns):
+            try:
+                chart_df = pd.DataFrame(rows[-24:]).copy()
+                chart_df["revenue_billion"] = pd.to_numeric(chart_df["revenue_billion"], errors="coerce")
+                chart_df = chart_df.dropna(subset=["revenue_billion"])
+                if not chart_df.empty:
+                    fig = go.Figure()
+                    fig.add_bar(x=chart_df["month"].astype(str), y=chart_df["revenue_billion"], name="月營收")
+                    fig.update_layout(height=250, margin=dict(l=5,r=5,t=8,b=5), showlegend=False, paper_bgcolor="#fffefb", plot_bgcolor="#fffefb", xaxis_title="", yaxis_title="億元")
+                    fig.update_xaxes(nticks=6, fixedrange=True)
+                    fig.update_yaxes(gridcolor="#ecebe5", fixedrange=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"{key}_rev", config={"displayModeBar":False})
+            except Exception as exc:
+                st.caption("營收圖暫時無法繪製，但上方數值表仍可使用。")
+    else:
+        latest = rev.get("latest") or {}
+        if latest:
+            st.dataframe(pd.DataFrame([{
+                "月份": latest.get("month"), "營收(億元)": latest.get("revenue_billion"),
+                "MoM(%)": latest.get("mom_pct"), "YoY(%)": latest.get("yoy_pct")
+            }]), hide_index=True, use_container_width=True)
+            rendered += 1
+            st.caption("目前資料源僅提供最新月份；取得歷史資料後會自動顯示趨勢圖。")
+        else:
+            st.caption("未取得月營收明細。")
+
+    st.markdown("#### EPS / 毛利率")
     qhist = fin.get("history_quarters") or fin.get("quarters") or []
     if qhist:
-        qdf = pd.DataFrame(qhist[-8:])
-        if not qdf.empty and {"quarter","eps"}.issubset(qdf.columns):
-            fig = go.Figure()
-            fig.add_bar(x=qdf["quarter"], y=pd.to_numeric(qdf["eps"], errors="coerce"), name="EPS")
-            fig.update_layout(height=240, margin=dict(l=5,r=5,t=8,b=5), showlegend=False, paper_bgcolor="#fffefb", plot_bgcolor="#fffefb", xaxis_title="", yaxis_title="EPS")
-            fig.update_xaxes(fixedrange=True)
-            fig.update_yaxes(gridcolor="#ecebe5", fixedrange=True)
-            st.plotly_chart(fig, use_container_width=True, key=f"{key}_eps", config={"displayModeBar":False})
+        qdf = pd.DataFrame(qhist[-8:]).copy()
+        cols = [c for c in ["quarter", "eps", "eps_ytd_sum_unadjusted", "gross_margin_pct"] if c in qdf.columns]
+        if cols:
+            show = qdf[cols].rename(columns={"quarter":"季別", "eps":"單季EPS", "eps_ytd_sum_unadjusted":"同年度累積EPS*", "gross_margin_pct":"毛利率(%)"})
+            st.dataframe(show, hide_index=True, use_container_width=True)
+            rendered += 1
+        if {"quarter", "eps"}.issubset(qdf.columns):
+            try:
+                chart_df = qdf[["quarter", "eps"]].copy()
+                chart_df["eps"] = pd.to_numeric(chart_df["eps"], errors="coerce")
+                chart_df = chart_df.dropna(subset=["eps"])
+                if not chart_df.empty:
+                    fig = go.Figure()
+                    fig.add_bar(x=chart_df["quarter"].astype(str), y=chart_df["eps"], name="EPS")
+                    fig.update_layout(height=240, margin=dict(l=5,r=5,t=8,b=5), showlegend=False, paper_bgcolor="#fffefb", plot_bgcolor="#fffefb", xaxis_title="", yaxis_title="EPS")
+                    fig.update_xaxes(fixedrange=True)
+                    fig.update_yaxes(gridcolor="#ecebe5", fixedrange=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"{key}_eps", config={"displayModeBar":False})
+            except Exception:
+                st.caption("EPS 圖暫時無法繪製，但上方數值表仍可使用。")
+        st.caption("* 同年度累積 EPS 為單季直接加總；配股／分割時可能與公司重編累積值不同。")
+    elif fin.get("latest_ytd_eps") is not None:
+        st.dataframe(pd.DataFrame([{
+            "期間": fin.get("latest_period") or "最新季報",
+            "累積EPS": fin.get("latest_ytd_eps"),
+            "毛利率(%)": fin.get("gross_margin_latest_pct"),
+        }]), hide_index=True, use_container_width=True)
+        rendered += 1
+        st.caption("目前資料源僅提供最新累計 EPS；取得單季歷史後才繪製 EPS 趨勢。")
+    else:
+        st.caption("未取得 EPS / 季財報明細。")
+
+    st.markdown("#### 三大法人")
     daily = inst.get("daily_rows") or []
     if daily:
-        ddf = pd.DataFrame(daily[-15:])
-        st.markdown("#### 近月法人日別")
-        st.dataframe(ddf.rename(columns={"date":"日期","foreign_net_lots":"外資(張)","trust_net_lots":"投信(張)","dealer_net_lots":"自營商(張)","total_net_lots":"合計(張)"}), hide_index=True, use_container_width=True)
+        ddf = pd.DataFrame(daily[-22:]).copy()
+        cols = [c for c in ["date", "foreign_net_lots", "trust_net_lots", "dealer_net_lots", "total_net_lots"] if c in ddf.columns]
+        if cols:
+            ddf = ddf[cols].rename(columns={"date":"日期", "foreign_net_lots":"外資(張)", "trust_net_lots":"投信(張)", "dealer_net_lots":"自營商(張)", "total_net_lots":"合計(張)"})
+            st.dataframe(ddf, hide_index=True, use_container_width=True)
+            rendered += 1
+    elif inst.get("available"):
+        st.dataframe(pd.DataFrame([
+            ["外資", inst.get("foreign_net_lots")],
+            ["投信", inst.get("trust_net_lots")],
+            ["自營商", inst.get("dealer_net_lots")],
+            ["合計", inst.get("total_net_lots")],
+        ], columns=["類別", "近月淨買賣超(張)"]), hide_index=True, use_container_width=True)
+        rendered += 1
+        st.caption("目前取得的是近月彙總，日別明細尚未取得。")
+    else:
+        st.caption("未取得三大法人明細；若 FinMind 暫時限流／無回傳，其他公司資料仍會正常顯示。")
+
+    if source:
+        st.caption("明細資料來源：" + source)
+    if rendered == 0:
+        st.warning("本次沒有取得可顯示的營收、EPS 或法人明細。請稍後再展開；這不影響短／中／長線既有排名。")
 
 
-def _render_research(stock: dict):
+def _render_research(stock: dict, widget_scope: str):
+    ticker_for_cache = str(stock.get("ticker") or "").strip()
+    detail_cache = st.session_state.get("alpha_research_detail_cache", {})
+    cached = detail_cache.get(ticker_for_cache) if isinstance(detail_cache, dict) else None
+    if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
+        stock = dict(stock)
+        stock["research"] = _merge_research(stock.get("research") or {}, cached.get("data"))
     rev, fin, val, inst, main = _research(stock)
     latest = rev.get("latest") or {}
     qs = fin.get("quarters") or []
@@ -258,16 +399,26 @@ def _render_research(stock: dict):
       <div><small>三大法人合計</small><b>{esc(lots(inst.get('total_net_lots')) if inst.get('available') else '—')}</b></div>
     </div>""", unsafe_allow_html=True)
     if qs:
-        st.dataframe(pd.DataFrame([{"季度":q.get("quarter"),"EPS":q.get("eps"),"同年度累積EPS*":q.get("eps_ytd_sum_unadjusted"),"毛利率(%)":q.get("gross_margin_pct")} for q in qs[-4:]]),hide_index=True,use_container_width=True)
-        st.caption("* 依單季 EPS 加總；遇配股/分割可能與公司重編累計值不同。")
+        try:
+            st.dataframe(pd.DataFrame([{"季度":q.get("quarter"),"EPS":q.get("eps"),"同年度累積EPS*":q.get("eps_ytd_sum_unadjusted"),"毛利率(%)":q.get("gross_margin_pct")} for q in qs[-4:]]),hide_index=True,use_container_width=True)
+            st.caption("* 依單季 EPS 加總；遇配股/分割可能與公司重編累計值不同。")
+        except Exception:
+            st.caption("季財報摘要暫時無法表格化；可展開明細重新取得。")
     source=str((stock.get("research") or {}).get("source") or "")
     if source: st.caption("公司資料來源："+source)
     if rev.get("history_limited") or fin.get("history_limited"):
         st.caption("目前使用官方最新期備援資料；歷史不足時模型會降低基本面信心。")
     if inst.get("summary"): st.caption(str(inst.get("summary")))
-    key=str(stock.get("ticker") or "x").replace(".","_")
-    if st.toggle("顯示營收 / EPS / 法人明細", value=False, key=f"fund_toggle_{key}"):
-        _render_fundamental_charts(stock,key)
+
+    ticker = str(stock.get("ticker") or "x")
+    safe_scope = "".join(ch if ch.isalnum() else "_" for ch in f"{widget_scope}_{ticker}")[-140:]
+    if st.toggle("顯示營收 / EPS / 法人明細", value=False, key=f"fund_toggle_{safe_scope}"):
+        detail_research, err = _research_detail_for_ticker(stock)
+        detail_stock = dict(stock)
+        detail_stock["research"] = detail_research
+        if err:
+            st.warning("公司／法人明細重新取得時有部分資料源未回應；已顯示可取得的資料。")
+        _render_fundamental_details(detail_stock, f"fund_{safe_scope}")
 
 
 def _chart_dataframe(chart: dict) -> pd.DataFrame:
@@ -497,7 +648,7 @@ def _row(stock: dict, h: str, snap: dict, rank: int, live: bool = False):
 
     label = f"{name}｜數據與走勢"
     with st.expander(label, expanded=False):
-        _render_research(stock)
+        _render_research(stock, f"{'live' if live else h}_{rank}_{snap.get('snapshot_id','x')}")
         block = stock.get("horizons", {}).get(h, {}) or {}
         plan = block.get("plan") or {}
         if plan:
@@ -832,10 +983,10 @@ def _doctor(snap: dict | None):
 
 
 def main():
-    st.set_page_config(page_title="Alpha Radar 16.6", page_icon="◼", layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="Alpha Radar 16.6.1", page_icon="◼", layout="wide", initial_sidebar_state="collapsed")
     _bootstrap_secrets()
     st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown("<div class='mast'><div class='brand'>ALPHA<span>/TW</span></div><div class='version'>16.6 · 1-MIN DYNAMIC</div></div>", unsafe_allow_html=True)
+    st.markdown("<div class='mast'><div class='brand'>ALPHA<span>/TW</span></div><div class='version'>16.6.1 · 1-MIN DYNAMIC · DETAIL FIX</div></div>", unsafe_allow_html=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     now = _taipei_timestamp()
@@ -960,7 +1111,7 @@ def main():
         st.markdown("<div class='section-kicker'>CHECK</div><div class='section-title'>個股診斷</div>", unsafe_allow_html=True)
         _doctor(snap)
 
-    st.caption("V16.6 動態盤中架構：完整日線決定『選誰』；盤中即時層決定『現在是否值得買』；盤後／盤前層規劃『下一交易日關注與買入區』。模型目標價、剩餘報酬與報酬/風險均為歷史資料推估，不保證未來報酬。")
+    st.caption("V16.6.1：完整日線決定『選誰』；盤中即時層決定『現在是否值得買』；盤後／盤前層規劃『下一交易日關注與買入區』。模型目標價、剩餘報酬與報酬/風險均為歷史資料推估，不保證未來報酬。")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,33 @@
+# Alpha Radar V16.6 final test output
+
+PASS compileall
+PASS test_config_weights
+PASS test_entry_separation
+PASS test_regime_only_changes_position
+PASS test_time_matured_intraday_weight
+PASS test_session_phases
+PASS test_limit_up_can_rank_high_but_not_be_buyable
+PASS test_actionable_buy_priority_not_raw_momentum
+PASS test_empirical_confidence_shrinkage
+PASS test_tail_risk_controls_reward_risk
+PASS test_low_evidence_cannot_be_promoted_to_buy
+PASS test_dynamic_full_market_pool_adds_new_live_leader
+PASS test_continuation_entry_is_explicit_but_not_chase
+PASS test_failed_gate_diagnostics_are_specific
+PASS test_validation_protocol_has_at_least_ten_points
+PASS test_validation_holdout_can_reject_overfit_tuning
+PASS test_offline_single_stock_pipeline
+PASS test_utf8_ui_strings_are_clean
+PASS test_cross_horizon_allocation_helpers
+PASS test_app_service_api_contract
+PASS test_app_all_session_contract
+PASS test_offline_run_scan_regime_does_not_rank
+PASS test_postclose_pending_to_final_transition
+PASS test_shared_feature_engine_matches_legacy_calls
+BENCH shared_features=0.0934s separate_3x=0.1268s speedup=1.36x
+ALL TESTS PASSED | v16.6.0-dynamic-intraday
+Alpha Radar V16.6 app import smoke: PASS
+Alpha Radar V16.6 app main smoke: PASS
+Alpha Radar V16.6 decision views smoke: PASS
+quotes=1500 detail=220 refresh=60s
+dynamic_pool_median=0.5435s p95=0.5945s max=0.6170s

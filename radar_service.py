@@ -836,6 +836,33 @@ def _evaluate_one(
     return stock
 
 
+def research_on_demand(ticker: str, data_dir: Path, include_branch: bool = False) -> dict:
+    """Fetch/cache research detail for one stock without rerunning the market model.
+
+    This path is display-only.  It is intentionally separate from ranking so an
+    on-demand UI click can never change the already-published short/mid/long
+    scores.  ResearchDataClient itself keeps a SQLite cache and fails open when a
+    provider is unavailable.
+    """
+    clean = str(ticker or "").strip()
+    if not clean:
+        return {"error": "EMPTY_TICKER", "source": "research unavailable"}
+    try:
+        client = ResearchDataClient(Path(data_dir) / "research_cache.sqlite")
+        return client.stock_research(clean, include_branch=bool(include_branch))
+    except Exception as exc:
+        return {
+            "stock_id": clean.split(".")[0],
+            "error": f"{type(exc).__name__}: {exc}",
+            "monthly_revenue": {"available": False, "rows": []},
+            "financials": {"available": False, "quarters": []},
+            "valuation": {"available": False},
+            "institutional_flow": {"available": False},
+            "main_force_proxy": {"available": False, "reason": "NOT_REQUESTED"},
+            "source": "research unavailable",
+        }
+
+
 def diagnose(code: str, snap: dict | None, data_dir: Path) -> dict:
     clean = str(code or "").strip()
     if not clean:
